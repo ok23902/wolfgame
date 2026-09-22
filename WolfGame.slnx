@@ -1,4 +1,3 @@
 <Solution>
-  <Project Path="../../../../dev/mano/mano.csproj" />
   <Project Path="WolfGame.csproj" />
 </Solution>
