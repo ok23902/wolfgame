@@ -1,0 +1,54 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Rider / ReSharper
+.idea/
+_ReSharper*/
+*.DotSettings.user
+
+# NuGet
+*.nupkg
+*.snupkg
+**/packages/
+.nuget/
+
+# Test results
+TestResults/
+*.trx
+
+# Code coverage
+coverage/
+*.coverage
+*.coveragexml
+
+# Generated files
+Generated/
+*.generated.cs
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local configuration / secrets
+appsettings.Local.json
+appsettings.Development.json
+secrets.json
+
+# Publish
+publish/
+*.publishsettings
+
+#WolfGame固有
+.env
+json/
