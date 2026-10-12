@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Text;
+using static mano.Llm;
 
 namespace mano;
 
@@ -15,8 +16,8 @@ public class WolfTrait : ManoTrait<WolfObject>
         var chars = self.Direct<CharacterObject>().ToList();
         if (chars.Count < 3) throw new InvalidOperationException("Not enough players.");
 
-        // ★ 先に前回の記憶を要約（あれば）
-        await SummarizeAllMemoriesAsync(self);
+        // ★ 前回の記憶を要約（失敗しても続行）
+        await SafeSummarizeAsync(self);
 
         self.Roles.Clear();
         self.Deaths.Clear();
@@ -35,13 +36,11 @@ public class WolfTrait : ManoTrait<WolfObject>
         {
             c.IsAlive = true;
             c.Role = "";
-            // ★ c.Memory.Clear() は削除（要約で置換済み）
             c.PendingAction = "";
             c.PendingVote = "";
             c.Status = "normal";
         }
 
-        // 役職配布
         var shuffled = chars.OrderBy(_ => Rng.Next()).ToList();
         var wolfCount = Math.Max(1, chars.Count / 4);
         for (int i = 0; i < shuffled.Count; i++)
@@ -59,7 +58,14 @@ public class WolfTrait : ManoTrait<WolfObject>
         {
             if (c is PlayerObject)
             {
-                Log(self, new GameEvent { Day = 1, Phase = "Setup", Kind = "system", SpeakerName = "SYSTEM", Text = $"あなたの役職: {RoleJa(c.Role)}" });
+                Log(self, new GameEvent
+                {
+                    Day = 1,
+                    Phase = "Setup",
+                    Kind = "system",
+                    SpeakerName = "SYSTEM",
+                    Text = $"あなたの役職: {RoleJa(c.Role)}"
+                });
             }
         }
     }
@@ -148,14 +154,12 @@ public class WolfTrait : ManoTrait<WolfObject>
         self.VotesExpected = voters.Count;
         self.RaiseVoteProgressChanged();
 
-        int received = 0;
-        await Task.WhenAll(voters.Select(async c =>
+        foreach (var c in voters)
         {
-            await c.Exec("DayVote");
-            var n = Interlocked.Increment(ref received);
-            self.VotesReceived = n;
+            await ExecWithRetry(self, c, "DayVote");
+            self.VotesReceived++;
             self.RaiseVoteProgressChanged();
-        }));
+        }
 
         foreach (var c in self.Direct<CharacterObject>().Where(x => x.IsAlive))
         {
@@ -242,8 +246,9 @@ public class WolfTrait : ManoTrait<WolfObject>
         foreach (var c in self.Direct<CharacterObject>())
             c.PendingAction = "";
 
+        // ★ 直列 + リトライ
         foreach (var c in self.Direct<CharacterObject>().Where(x => x.IsAlive).ToList())
-            await c.Exec("Night");
+            await ExecWithRetry(self, c, "Night");
 
         var wolfChoice = self.Direct<CharacterObject>()
             .FirstOrDefault(c => c.IsAlive && c.Role == "wolf" && !string.IsNullOrEmpty(c.PendingAction));
@@ -300,7 +305,7 @@ public class WolfTrait : ManoTrait<WolfObject>
                 SpeakerName = "SYSTEM",
                 Text = "村人陣営の勝利"
             });
-            AppendGameResult(self);   // ★ 勝敗確定時に結果を記憶へ
+            AppendGameResult(self);
             return true;
         }
 
@@ -316,18 +321,13 @@ public class WolfTrait : ManoTrait<WolfObject>
                 SpeakerName = "SYSTEM",
                 Text = "人狼陣営の勝利"
             });
-            AppendGameResult(self);   // ★
+            AppendGameResult(self);
             return true;
         }
 
         return false;
     }
 
-    /// <summary>
-    /// ゲーム終了時に、全キャラの Memory に結果（役職一覧）を追加する。
-    /// Memory にはこの時点で会話ログも残っているので、後日談として成立する。
-    /// 次のゲーム開始時に SummarizeAllMemoriesAsync が全記憶を要約する。
-    /// </summary>
     private static void AppendGameResult(WolfObject self)
     {
         var winnerJa = self.Winner == "wolf" ? "人狼陣営" : "村人陣営";
@@ -338,8 +338,7 @@ public class WolfTrait : ManoTrait<WolfObject>
         {
             var c = self.Direct<CharacterObject>().FirstOrDefault(x => x.Id == kv.Key);
             if (c == null) continue;
-            var role = RoleJa(kv.Value);
-            sb.AppendLine($"- {c.Name}: {role}");
+            sb.AppendLine($"- {c.Name}: {RoleJa(kv.Value)}");
         }
         var text = sb.ToString();
 
@@ -347,22 +346,18 @@ public class WolfTrait : ManoTrait<WolfObject>
             c.Memory.Add(text);
     }
 
-    // ---------- ヘルパー ----------
+    // ---------- 発言（レート制限対応） ----------
 
     private static async Task Speak(WolfObject wolf, CharacterObject c, string eventId)
     {
         wolf.ThinkingId = c.Id;
-        c.Status = "think";
         wolf.RaiseThinkingChanged(c.Id);
-        try
-        {
-            await c.Exec(eventId);
-        }
-        finally
-        {
-            wolf.ThinkingId = null;
-            wolf.RaiseThinkingChanged(null);
-        }
+
+        var ok = await ExecWithRetry(wolf, c, eventId);
+
+        wolf.ThinkingId = null;
+        wolf.RaiseThinkingChanged(null);
+        wolf.RaiseRateLimitRecovered();
 
         Log(wolf, new GameEvent
         {
@@ -379,6 +374,8 @@ public class WolfTrait : ManoTrait<WolfObject>
         foreach (var o in wolf.Direct<CharacterObject>().Where(o => o.IsAlive))
             o.Memory.Add(line);
     }
+
+    // ---------- ヘルパー ----------
 
     internal static void Log(WolfObject wolf, GameEvent e)
     {
@@ -453,10 +450,24 @@ public class WolfTrait : ManoTrait<WolfObject>
             if (!wolf.TurnOrder.Contains(c.Id)) yield return c;
     }
 
-    /// <summary>
-    /// 全キャラの Memory を1回のLLM呼び出しで要約し、置換する。
-    /// 次のゲーム開始時に呼ばれる。
-    /// </summary>
+    // ---------- 記憶要約 ----------
+
+    private static async Task SafeSummarizeAsync(WolfObject self)
+    {
+        try
+        {
+            await SummarizeAllMemoriesAsync(self);
+        }
+        catch (LlmRateLimitException)
+        {
+            Debug.WriteLine("[SUMMARY] rate limited, skipped.");
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[SUMMARY] failed: {ex.Message}");
+        }
+    }
+
     private static async Task SummarizeAllMemoriesAsync(WolfObject self)
     {
         var memories = self.Direct<CharacterObject>()
@@ -485,6 +496,51 @@ public class WolfTrait : ManoTrait<WolfObject>
             c.Memory.Clear();
             c.Memory.Add("【前回までのゲーム】");
             c.Memory.Add(summary);
+        }
+    }
+    /// <summary>
+    /// 429 が出たら指数バックオフでリトライ。
+    /// 上限に達したらパネルを出してユーザー判断待ち。
+    /// </summary>
+    private static async Task<bool> ExecWithRetry(WolfObject wolf, CharacterObject c, string eventId)
+    {
+        const int MaxRetries = 3;
+        int attempt = 0;
+
+        while (true)
+        {
+            try
+            {
+                await c.Exec(eventId);
+                return true;
+            }
+            catch (LlmRateLimitException)
+            {
+                c.Status = "sleep";
+                wolf.RaiseCharacterStatusChanged(c.Id, "sleep");
+
+                if (attempt >= MaxRetries)
+                {
+                    wolf.RaiseRateLimitExhausted(c.Id, c.Name);
+                    wolf.RateLimitResume = new TaskCompletionSource<bool>();
+                    var resume = await wolf.RateLimitResume.Task;
+
+                    if (!resume) return false;
+
+                    attempt = 0;
+                    c.Status = "think";
+                    wolf.RaiseCharacterStatusChanged(c.Id, "think");
+                    continue;
+                }
+
+                var waitSec = Math.Pow(2, attempt + 1);
+                wolf.RaiseRateLimitWaiting(c.Id, c.Name, attempt + 1, MaxRetries, waitSec);
+                await Task.Delay(TimeSpan.FromSeconds(waitSec));
+
+                c.Status = "think";
+                wolf.RaiseCharacterStatusChanged(c.Id, "think");
+                attempt++;
+            }
         }
     }
 }

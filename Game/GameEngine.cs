@@ -17,7 +17,11 @@ public class GameEngine
     public event Action? VoteProgressChanged;
     public event Action<string>? GameEnded;
     public event Action? ChatRoundStarted;
-
+    public event Action<Exception>? ErrorOccurred;
+    public event Action<string, string>? CharacterStatusChanged;
+    public event Action<string, string, int, int, double>? RateLimitWaiting;
+    public event Action<string, string>? RateLimitExhausted;
+    public event Action? RateLimitRecovered;
 
     public bool StartRequested { get; set; }
 
@@ -58,6 +62,10 @@ public class GameEngine
         Wolf.EventLogged += e => EventEmitted?.Invoke(e);
         Wolf.ThinkingChanged += id => ThinkingChanged?.Invoke(id);
         Wolf.VoteProgressChanged += () => VoteProgressChanged?.Invoke();
+        Wolf.CharacterStatusChanged += (id, s) => CharacterStatusChanged?.Invoke(id, s);
+        Wolf.RateLimitWaiting += (id, n, a, m, w) => RateLimitWaiting?.Invoke(id, n, a, m, w);
+        Wolf.RateLimitExhausted += (id, n) => RateLimitExhausted?.Invoke(id, n);
+        Wolf.RateLimitRecovered += () => RateLimitRecovered?.Invoke();
 
         Wolf.Phase = "Chat";
         Wolf.IsGameOver = false;
@@ -70,22 +78,21 @@ public class GameEngine
     {
         try
         {
-            while (true)   // ★ ゲーム終了後もループ
+            while (true)
             {
                 await Wolf.Exec("ResetForChat");
                 Wolf.Phase = "Chat";
                 Wolf.IsGameOver = false;
-                Wolf.StartRequested = false;   // ★ リセット
+                Wolf.StartRequested = false;
                 StateChanged?.Invoke(Wolf);
                 ChatRoundStarted?.Invoke();
 
                 while (!Wolf.StartRequested)
                 {
                     await Wolf.Exec("ChatRound");
-                    await Task.Yield();   // ★ 他スレッドに処理を譲る
+                    await Task.Yield();
                 }
 
-                // ---- ゲーム開始 ----
                 await Wolf.Exec("StartGame");
                 StateChanged?.Invoke(Wolf);
 
@@ -96,10 +103,7 @@ public class GameEngine
                     await Task.Yield();
                 }
 
-                // ---- ゲーム終了 ----
                 GameEnded?.Invoke(Wolf.Winner);
-
-                // ダイアログ閉じるまで待機（UI 側で ReadyForNext をセット）
                 await WaitForNextRoundAsync();
             }
         }
@@ -107,23 +111,19 @@ public class GameEngine
         {
             System.Diagnostics.Debug.WriteLine($"[RUN FAIL] {ex.GetType().Name}: {ex.Message}");
             System.Diagnostics.Debug.WriteLine(ex.StackTrace);
-            // ★ UIにも知らせる
-            GameEnded?.Invoke($"ERROR: {ex.Message}");
-            throw;
+            ErrorOccurred?.Invoke(ex);
         }
     }
 
-    // ★ UI が「次のラウンドへ」を押すまで待つ
     private TaskCompletionSource<bool>? _nextRoundTcs;
 
-    public void ProceedToNextRound()
-    {
-        _nextRoundTcs?.TrySetResult(true);
-    }
+    public void ProceedToNextRound() => _nextRoundTcs?.TrySetResult(true);
 
     private Task WaitForNextRoundAsync()
     {
         _nextRoundTcs = new TaskCompletionSource<bool>();
         return _nextRoundTcs.Task;
     }
+
+    public void ResumeRateLimit(bool resume) => Wolf.ResumeRateLimit(resume);
 }
